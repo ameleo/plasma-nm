@@ -8,8 +8,12 @@
 
 #include "strongswanwidget.h"
 #include "nm-strongswan-service.h"
+#include "pkcs11certificates.h"
 #include "ui_strongswanprop.h"
 
+#include <KLocalizedString>
+
+#include <QLocale>
 #include <QString>
 #include <QUrl>
 
@@ -24,7 +28,63 @@ public:
         Smartcard,
         Eap
     };
+
+    void listSmartcardCertificates();
+    void selectSmartcardCertificate(const QString &uri);
+
+    bool smartcardCertificatesListed = false;
+    QList<Pkcs11Certificate> smartcardCertificates;
 };
+
+void StrongswanSettingWidgetPrivate::listSmartcardCertificates()
+{
+    if (smartcardCertificatesListed) {
+        return;
+    }
+    smartcardCertificatesListed = true;
+
+    // An empty URI leaves the choice to the VPN service
+    QComboBox *combo = ui.cmbSmartcardCertificate;
+    combo->clear();
+    combo->addItem(i18nc("@item:inlistbox smartcard certificate", "Any certificate (automatic)"), QString());
+
+    smartcardCertificates = listPkcs11Certificates();
+    for (const Pkcs11Certificate &certificate : std::as_const(smartcardCertificates)) {
+        const QString subject = certificate.subjectCommonName.isEmpty() ? certificate.subject : certificate.subjectCommonName;
+        combo->addItem(i18nc("@item:inlistbox smartcard certificate: %1 subject, %2 issuer, %3 expiry date, %4 token label",
+                             "%1 (issuer: %2, expires %3) on %4",
+                             subject,
+                             certificate.issuerCommonName,
+                             QLocale().toString(certificate.expiryDate.date(), QLocale::ShortFormat),
+                             certificate.tokenLabel),
+                       certificate.uri);
+        combo->setItemData(combo->count() - 1,
+                           i18nc("@info:tooltip smartcard certificate: %1 subject, %2 PKCS#11 URI", "Subject: %1\n%2", certificate.subject, certificate.uri),
+                           Qt::ToolTipRole);
+    }
+}
+
+void StrongswanSettingWidgetPrivate::selectSmartcardCertificate(const QString &uri)
+{
+    QComboBox *combo = ui.cmbSmartcardCertificate;
+    if (uri.isEmpty()) {
+        combo->setCurrentIndex(0);
+        return;
+    }
+    for (int i = 0; i < smartcardCertificates.size(); ++i) {
+        if (smartcardCertificates.at(i).matchesUri(uri)) {
+            combo->setCurrentIndex(i + 1);
+            return;
+        }
+    }
+    // Keep a certificate whose token is not present
+    int index = combo->findData(uri);
+    if (index < 0) {
+        combo->addItem(i18nc("@item:inlistbox smartcard certificate whose token is absent, %1 PKCS#11 URI", "Not found: %1", uri), uri);
+        index = combo->count() - 1;
+    }
+    combo->setCurrentIndex(index);
+}
 
 StrongswanSettingWidget::StrongswanSettingWidget(const NetworkManager::VpnSetting::Ptr &setting, QWidget *parent)
     : SettingWidget(setting, parent)
@@ -45,6 +105,13 @@ StrongswanSettingWidget::StrongswanSettingWidget(const NetworkManager::VpnSettin
     // Connect for validity check
     connect(d->ui.leGateway, &QLineEdit::textChanged, this, &StrongswanSettingWidget::slotWidgetChanged);
     connect(d->ui.proposal, &QGroupBox::toggled, this, &SettingWidget::settingChanged);
+
+    // Tokens are only queried once smartcard authentication is chosen
+    connect(d->ui.cmbMethod, &QComboBox::currentIndexChanged, this, [d](int index) {
+        if (index == StrongswanSettingWidgetPrivate::Smartcard) {
+            d->listSmartcardCertificates();
+        }
+    });
 
     KAcceleratorManager::manage(this);
 
@@ -90,6 +157,8 @@ void StrongswanSettingWidget::loadConfig(const NetworkManager::Setting::Ptr &set
         d->ui.leAuthSshCertificate->setUrl(QUrl::fromLocalFile(dataMap[NM_STRONGSWAN_USERCERT]));
     } else if (method == QLatin1String(NM_STRONGSWAN_AUTH_SMARTCARD)) {
         d->ui.cmbMethod->setCurrentIndex(StrongswanSettingWidgetPrivate::Smartcard);
+        d->listSmartcardCertificates();
+        d->selectSmartcardCertificate(dataMap[NM_STRONGSWAN_USERCERT]);
     } else if (method == QLatin1String(NM_STRONGSWAN_AUTH_EAP)) {
         d->ui.cmbMethod->setCurrentIndex(StrongswanSettingWidgetPrivate::Eap);
         d->ui.leUserName->setText(dataMap[NM_STRONGSWAN_USER]);
@@ -174,9 +243,14 @@ QVariantMap StrongswanSettingWidget::setting() const
         }
         break;
     }
-    case StrongswanSettingWidgetPrivate::Smartcard:
+    case StrongswanSettingWidgetPrivate::Smartcard: {
         data.insert(NM_STRONGSWAN_METHOD, NM_STRONGSWAN_AUTH_SMARTCARD);
+        const QString smartcardCertificate = d->ui.cmbSmartcardCertificate->currentData().toString();
+        if (!smartcardCertificate.isEmpty()) {
+            data.insert(NM_STRONGSWAN_USERCERT, smartcardCertificate);
+        }
         break;
+    }
     case StrongswanSettingWidgetPrivate::Eap:
         data.insert(NM_STRONGSWAN_METHOD, NM_STRONGSWAN_AUTH_EAP);
         if (!d->ui.leUserName->text().isEmpty()) {
